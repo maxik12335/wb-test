@@ -1,18 +1,17 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
-	"log"
+	"io/ioutil"
 	"time"
 
 	"database/sql"
-	"encoding/json"
 
 	_ "github.com/lib/pq"
 	"github.com/nats-io/stan.go"
 )
 
-// Структура для данных о доставке
 type Delivery struct {
 	Name    string `json:"name"`
 	Phone   string `json:"phone"`
@@ -23,217 +22,144 @@ type Delivery struct {
 	Email   string `json:"email"`
 }
 
-// Структура для данных о платеже
 type Payment struct {
 	Transaction  string `json:"transaction"`
 	RequestID    string `json:"request_id"`
 	Currency     string `json:"currency"`
 	Provider     string `json:"provider"`
 	Amount       int    `json:"amount"`
-	PaymentDT    int64  `json:"payment_dt"`
+	PaymentDt    int64  `json:"payment_dt"`
 	Bank         string `json:"bank"`
 	DeliveryCost int    `json:"delivery_cost"`
 	GoodsTotal   int    `json:"goods_total"`
 	CustomFee    int    `json:"custom_fee"`
 }
 
-// Структура для данных о товарах
 type Item struct {
+	ChrtID      int    `json:"chrt_id"`
 	TrackNumber string `json:"track_number"`
 	Price       int    `json:"price"`
-	RID         string `json:"rid"`
+	Rid         string `json:"rid"`
 	Name        string `json:"name"`
 	Sale        int    `json:"sale"`
 	Size        string `json:"size"`
 	TotalPrice  int    `json:"total_price"`
-	NMID        int    `json:"nm_id"`
+	NmID        int    `json:"nm_id"`
 	Brand       string `json:"brand"`
 	Status      int    `json:"status"`
 }
 
-
-// Структура для данных о заказе
-type Order struct {
-	OrderUID          string   `json:"order_uid"`
-	TrackNumber       string   `json:"track_number"`
-	Entry             string   `json:"entry"`
-	Delivery          Delivery `json:"delivery"`
-	Payment           Payment  `json:"payment"`
-	Items             []Item   `json:"items"`
-	Locale            string   `json:"locale"`
-	InternalSignature string   `json:"internal_signature"`
-	CustomerID        string   `json:"customer_id"`
-	DeliveryService   string   `json:"delivery_service"`
-	ShardKey          string   `json:"shardkey"`
-	SMID              int      `json:"sm_id"`
-	DateCreated       string   `json:"date_created"`
-	OofShard          string   `json:"oof_shard"`
-}
-
-// Функция для записи данных о заказе в БД
-func insertOrder(dbConn *sql.DB, order Order) error {
-	_, err := dbConn.Exec(
-		"INSERT INTO delivery (name, phone, zip, city, address, region, email) VALUES ($1, $2, $3, $4, $5, $6, $7)",
-		order.Delivery.Name, order.Delivery.Phone, order.Delivery.Zip, order.Delivery.City, order.Delivery.Address, order.Delivery.Region, order.Delivery.Email)
-	if err != nil {
-		return err
-	}
-	// ... аналогично выполните запросы для других таблиц ...
-	return nil
-}
-
-// Функция для записи данных о платеже в БД
-func insertPayment(dbConn *sql.DB, payment Payment) error {
-	_, err := dbConn.Exec(
-		"INSERT INTO payment (transaction, request_id, currency, provider, amount, payment_dt, bank, delivery_cost, goods_total, custom_fee) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
-		payment.Transaction, payment.RequestID, payment.Currency, payment.Provider, payment.Amount, time.Unix(payment.PaymentDT, 0), payment.Bank, payment.DeliveryCost, payment.GoodsTotal, payment.CustomFee)
-	if err != nil {
-		return err
-	}
-	return nil
-}
-
-// Функция для записи данных о товарах в БД
-func insertItems(dbConn *sql.DB, items []Item) error {
-	for _, item := range items {
-		_, err := dbConn.Exec(
-			"INSERT INTO item (track_number, price, rid, name, sale, size, total_price, nm_id, brand, status) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
-			item.TrackNumber, item.Price, item.RID, item.Name, item.Sale, item.Size, item.TotalPrice, item.NMID, item.Brand, item.Status)
-		if err != nil {
-			return err
-		}
-	}
-	return nil
+type OrderData struct {
+	OrderUID        string   `json:"order_uid"`
+	TrackNumber     string   `json:"track_number"`
+	Entry           string   `json:"entry"`
+	Delivery        Delivery `json:"delivery"`
+	Payment         Payment  `json:"payment"`
+	Items           []Item   `json:"items"`
+	Locale          string   `json:"locale"`
+	InternalSig     string   `json:"internal_signature"`
+	CustomerID      string   `json:"customer_id"`
+	DeliveryService string   `json:"delivery_service"`
+	ShardKey        string   `json:"shardkey"`
+	SmID            int      `json:"sm_id"`
+	DateCreated     string   `json:"date_created"`
+	OofShard        string   `json:"oof_shard"`
 }
 
 func main() {
-	// параметры для подключения к кластеру NATS Streaming
-	clusterID := "test-cluster"
-	clientID := "example-client"
-
-	// подключение к кластеру NATS Streaming
-	conn, err := stan.Connect(clusterID, clientID)
+	// подключение к PostgreSQL
+	database, err := sql.Open("postgres", "user=postgres dbname=orders host=localhost port=5433 password=admin sslmode=disable")
 	if err != nil {
-		log.Fatalf("Error connecting to NATS Streaming: %v", err)
+		fmt.Printf("Ошибка подключения к базе данных: %v\n", err)
 	}
-	defer conn.Close()
+	defer database.Close()
 
-	// имя канала, на который хотите подписаться
-	channel := "order-channel"
+	// подключение к NATS Streaming
+	clusterID := "test-cluster"
+	clientID := "test-client"
+
+	natsStreaming, err := stan.Connect(clusterID, clientID)
+	if err != nil {
+		fmt.Printf("Ошибка подключения к NATS Streaming: %v/n", err)
+	}
+	defer natsStreaming.Close()
 
 	// подписка на канал
-	sub, err := conn.Subscribe(channel, func(msg *stan.Msg) {
-		// обработка полученного сообщения
-		fmt.Printf("Recieved a message: %s\n", msg.Data)
+	channel := "test-channel"
 
-		// Распарсивание JSON
-		var orderData Order
-		err := json.Unmarshal(msg.Data, &orderData)
+	subscription, err := natsStreaming.Subscribe(channel, func(msg *stan.Msg) {
+		fmt.Printf("Получено сообщение: %s\n", msg.Data)
+
+		// Здесь вы можете добавить код для преобразования данных из сообщения в структуру OrderData
+		var order OrderData
+		err := json.Unmarshal(msg.Data, &order)
 		if err != nil {
-			log.Printf("Error parsing JSON: %v", err)
+			fmt.Printf("Ошибка разбора JSON: %v\n", err)
 			return
 		}
 
-		// Подключение к базе данных
-		connStr := "user=postgres dbname=orders sslmode=disable port=5433"
-		dbConn, err := sql.Open("postgres", connStr)
-		if err != nil {
-			log.Printf("Error connecting to DB: %v", err)
-			return
-		}
-		defer dbConn.Close()
+		// Теперь можно вставить данные в базу данных
 
+		// Вставка данных в таблицу orders
+		_, err = database.Exec(`
+					INSERT INTO orders (order_uid, track_number, entry, locale, internal_signature, customer_id, delivery_service, shardkey, sm_id, date_created, oof_shard)
+					VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+			`, order.OrderUID, order.TrackNumber, order.Entry, order.Locale, order.InternalSig, order.CustomerID, order.DeliveryService, order.ShardKey, order.SmID, order.DateCreated, order.OofShard)
 		if err != nil {
-			log.Printf("Error connecting to DB: %v", err)
-			return
-		}
-		defer dbConn.Close()
-
-		// Вызов функции записи данных в БД
-		err = insertOrder(dbConn, orderData)
-		if err != nil {
-			log.Printf("Error inserting order into DB: %v", err)
+			fmt.Printf("Ошибка записи в PostgreSQL: %v\n", err)
 			return
 		}
 
-		// Вызов функции записи данных о платеже в БД
-		err = insertPayment(dbConn, orderData.Payment)
+		// Вставка данных в таблицу delivery
+		_, err = database.Exec(`
+					INSERT INTO delivery (order_id, name, phone, zip, city, address, region, email)
+					VALUES (lastval(), $1, $2, $3, $4, $5, $6, $7)
+			`, order.Delivery.Name, order.Delivery.Phone, order.Delivery.Zip, order.Delivery.City, order.Delivery.Address, order.Delivery.Region, order.Delivery.Email)
 		if err != nil {
-			log.Printf("Error inserting payment into DB: %v", err)
+			fmt.Printf("Ошибка записи в PostgreSQL: %v\n", err)
 			return
 		}
 
-		// Вызов функции записи данных о товарах в БД
-		err = insertItems(dbConn, orderData.Items)
+		// Вставка данных в таблицу payment
+		_, err = database.Exec(`
+					INSERT INTO payment (order_id, transaction, request_id, currency, provider, amount, payment_dt, bank, delivery_cost, goods_total, custom_fee)
+					VALUES (lastval(), $1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+			`, order.Payment.Transaction, order.Payment.RequestID, order.Payment.Currency, order.Payment.Provider, order.Payment.Amount, order.Payment.PaymentDt, order.Payment.Bank, order.Payment.DeliveryCost, order.Payment.GoodsTotal, order.Payment.CustomFee)
 		if err != nil {
-			log.Printf("Error inserting items into DB: %v", err)
+			fmt.Printf("Ошибка записи в PostgreSQL: %v\n", err)
 			return
 		}
 
+		// Вставка данных в таблицу item
+		for _, item := range order.Items {
+			_, err = database.Exec(`
+							INSERT INTO item (order_id, chrt_id, track_number, price, rid, name, sale, size, total_price, nm_id, brand, status)
+							VALUES (lastval(), $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+					`, item.ChrtID, item.TrackNumber, item.Price, item.Rid, item.Name, item.Sale, item.Size, item.TotalPrice, item.NmID, item.Brand, item.Status)
+			if err != nil {
+				fmt.Printf("Ошибка записи в PostgreSQL: %v\n", err)
+				return
+			}
+		}
 	})
-
 	if err != nil {
-		log.Fatalf("Error subscribing to channel: %v", err)
+		fmt.Printf("Ошибка подписки на канал: %v/n", err)
 	}
-	defer sub.Unsubscribe()
+	defer subscription.Close()
 
-	// отправка сообщений
-	// message := []byte("Hello, NATA Streaming")
-	message := []byte(`{
-			"order_uid": "b563feb7b2b84b6test",
-			"track_number": "WBILMTESTTRACK",
-			"entry": "WBIL",
-			"delivery": {
-				"name": "Test Testov",
-				"phone": "+9720000000",
-				"zip": "2639809",
-				"city": "Kiryat Mozkin",
-				"address": "Ploshad Mira 15",
-				"region": "Kraiot",
-				"email": "test@gmail.com"
-			},
-			"payment": {
-				"transaction": "b563feb7b2b84b6test",
-				"request_id": "",
-				"currency": "USD",
-				"provider": "wbpay",
-				"amount": 1817,
-				"payment_dt": 1637907727,
-				"bank": "alpha",
-				"delivery_cost": 1500,
-				"goods_total": 317,
-				"custom_fee": 0
-			},
-			"items": [
-				{
-					"chrt_id": 9934930,
-					"track_number": "WBILMTESTTRACK",
-					"price": 453,
-					"rid": "ab4219087a764ae0btest",
-					"name": "Mascaras",
-					"sale": 30,
-					"size": "0",
-					"total_price": 317,
-					"nm_id": 2389212,
-					"brand": "Vivienne Sabo",
-					"status": 202
-				}
-			],
-			"locale": "en",
-			"internal_signature": "",
-			"customer_id": "test",
-			"delivery_service": "meest",
-			"shardkey": "9",
-			"sm_id": 99,
-			"date_created": "2021-11-26T06:22:19Z",
-			"oof_shard": "1"
-		}`)
-
-	err = conn.Publish(channel, message)
+	// отправить сообщение
+	// получить данные из model.json
+	filecontent, err := ioutil.ReadFile("model.json")
 	if err != nil {
-		log.Fatalf("Error publishing message: %v", err)
+		fmt.Printf("Ошибка чтения файла: %v\n", err)
+		return
 	}
 
-	// ожидание сообщений (можно вставить в цикл)
-	time.Sleep(time.Second * 5)
+	err = natsStreaming.Publish(channel, filecontent)
+	if err != nil {
+		fmt.Printf("Ошибка отправки сообщения: %v\n", err)
+		return
+	}
+
+	time.Sleep(2 * time.Second)
 }
